@@ -20,7 +20,19 @@ Among the things investigated are
 
 Language model fit is evaluated with perplexity. Multilinguality with 
 Word Alignment, Sentence Retrieval and Word Translation. See the paper
-for more details. The (forthcoming) link to the corresponding arxiv upload is here: [Paper](https://arxiv.org/pdf/tbd.pdf)
+for more details. 
+
+You can find the paper on arxiv: 
+
+```
+@article{dufter2020identifying,
+  title={Identifying Necessary Elements for BERT’s Multilinguality},
+  author={Dufter, Philipp and Sch{\"u}tze, Hinrich},
+  journal={arXiv preprint to be announced},
+  year={2020}
+}
+```
+
 If you use the code, please consider citing the paper.
 
 
