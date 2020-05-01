@@ -122,6 +122,7 @@ def evaluate_retrieval(vectors, args):
         print("Number of sentences is different?")
     # get different p@k
     nns = np.argsort(dist, axis=1)[:, :10]
+    # import ipdb;ipdb.set_trace()
     gt = np.arange(dist.shape[0]).reshape(-1, 1)
     p = {}
     for considern in [1, 5, 10]:
@@ -198,6 +199,8 @@ def get_modifications(args, config):
         modifications.append("no-random")
     if args.no_parallel_data:
         modifications.append("no-parallel")
+    if args.replace_with_nn:
+        modifications.append("repl-nn")
     if config.hidden_size > 64:
         modifications.append("overparam")
     if len(modifications) == 0:
@@ -244,6 +247,7 @@ def format_result_line(args, perplexity, alignment_results, retrieval_results, t
 
 
 def evaluate_all(args):
+    import ipdb;ipdb.set_trace()
     outfile = open(args.outfile, "a")
     model, tokenizer, config = utils.load_embedding_model(args.model_name_or_path)
     args.special_token_indices = set([tokenizer.cls_token_id,
@@ -271,8 +275,6 @@ def evaluate_all(args):
 
 def main():
     '''
-    TODO
-    add capability to use only n sentences
     '''
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -314,6 +316,7 @@ def main():
     parser.add_argument("--delete_position_segment_embeddings", action="store_true", help="FAKE NOT REQUIRED")
     parser.add_argument("--do_not_replace_with_random_words", action="store_true", help="FAKE NOT REQUIRED")
     parser.add_argument("--no_parallel_data", action="store_true", help="FAKE NOT REQUIRED")
+    parser.add_argument("--replace_with_nn", action="store_true", help="FAKE NOT REQUIRED")
 
     args = parser.parse_args()
 

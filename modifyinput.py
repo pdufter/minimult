@@ -1,5 +1,8 @@
 import torch
-from typing import Set, Tuple, Text
+from typing import Any, Set, Tuple, Text
+from sklearn.metrics.pairwise import cosine_distances
+import numpy as np
+# TMPCOUNT = -1
 
 
 def get_is_shifted(inputids: torch.Tensor, shift: int) -> torch.Tensor:
@@ -42,3 +45,25 @@ def shift_special_tokens(inputids: torch.Tensor, shift: int, special_token_indic
     shift_dict = {k: k + shift for k in special_token_indices}
     for k, v in shift_dict.items():
         inputids[(inputids == k) & is_shifted] = v
+
+
+def replace_with_nn(inputids: torch.Tensor, model: Any, indices_random: torch.Tensor) -> torch.Tensor:
+    # global TMPCOUNT
+    # TMPCOUNT += 1
+    # if False and TMPCOUNT % 135 == 0:
+    #     import ipdb;ipdb.set_trace()
+
+    large_number = 999
+    shift = model.config.shift
+    embeddings = model.bert.embeddings.word_embeddings.weight.detach().cpu().numpy()
+    queries = inputids[indices_random]
+    is_shifted = get_is_shifted(queries.unsqueeze(1), shift).squeeze()
+    dist = cosine_distances(embeddings[queries, :], embeddings)
+    # restrict nn search to the other language
+    large = np.zeros_like(dist)
+    large[np.array(is_shifted), shift:] = large_number
+    large[~np.array(is_shifted), :shift] = large_number
+    dist += large
+    nns = torch.LongTensor(np.argsort(dist, axis=1)[:, :1])
+    inputids[indices_random] = nns.squeeze()
+    

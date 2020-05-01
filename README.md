@@ -9,5 +9,7 @@ BERT to create multilingual representations.
 
 More to come...
 
-minimult
-breakmult
+
+# TODO
+* Update readme
+* link arxiv upload

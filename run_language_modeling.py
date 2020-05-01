@@ -61,7 +61,7 @@ except ImportError:
 
 from projects.multlrf.shift import add_shifted_input, remove_parallel_data
 from projects.multlrf.modifymodel import delete_position_segment_embeddings
-from projects.multlrf.modifyinput import invert, get_language_specific_positions, shift_special_tokens
+from projects.multlrf.modifyinput import invert, get_language_specific_positions, shift_special_tokens, replace_with_nn
 
 
 logger = logging.getLogger(__name__)
@@ -184,7 +184,7 @@ def _rotate_checkpoints(args, checkpoint_prefix="checkpoint", use_mtime=False) -
         shutil.rmtree(checkpoint)
 
 
-def mask_tokens(inputs: torch.Tensor, tokenizer: PreTrainedTokenizer, args) -> Tuple[torch.Tensor, torch.Tensor]:
+def mask_tokens(inputs: torch.Tensor, tokenizer: PreTrainedTokenizer, args, model: PreTrainedModel) -> Tuple[torch.Tensor, torch.Tensor]:
     """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
     if tokenizer.mask_token is None:
         raise ValueError(
@@ -209,11 +209,12 @@ def mask_tokens(inputs: torch.Tensor, tokenizer: PreTrainedTokenizer, args) -> T
     inputs[indices_replaced] = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
 
     # 10% of the time, we replace masked input tokens with random word
+    indices_random = torch.bernoulli(torch.full(labels.shape, float(args.replacement_probs.split(",")[1]))).bool() & masked_indices & ~indices_replaced
     if args.do_not_replace_with_random_words:
-        indices_random = torch.bernoulli(torch.full(labels.shape, float(args.replacement_probs.split(",")[1]))).bool() & masked_indices & ~indices_replaced
         inputs[indices_random] = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
+    elif args.replace_with_nn:
+        replace_with_nn(inputs, model, indices_random)
     else:
-        indices_random = torch.bernoulli(torch.full(labels.shape, float(args.replacement_probs.split(",")[1]))).bool() & masked_indices & ~indices_replaced
         random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long)
         inputs[indices_random] = random_words[indices_random]
 
@@ -354,7 +355,7 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
                 # segment_ids = torch.zeros(input_shape, dtype=torch.long)
                 # position_ids = position_ids.to(args.device)
                 # segment_ids = segment_ids.to(args.device)
-            inputs, labels = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
+            inputs, labels = mask_tokens(batch, tokenizer, args, model) if args.mlm else (batch, batch)
             if args.shift_special_tokens:
                 shift_special_tokens(inputs, model.config.shift, args.special_token_indices)
             inputs = inputs.to(args.device)
@@ -489,7 +490,7 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
             segment_ids = segment_ids.to(args.device)
         else:
             position_ids, segment_ids = None, None
-        inputs, labels = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
+        inputs, labels = mask_tokens(batch, tokenizer, args, model) if args.mlm else (batch, batch)
         if args.shift_special_tokens:
             shift_special_tokens(inputs, model.config.shift, args.special_token_indices)
         mycounter += 1
@@ -679,6 +680,7 @@ def main():
     parser.add_argument("--shift_special_tokens", action="store_true", help="")
 
     parser.add_argument("--do_not_replace_with_random_words", action="store_true", help="")
+    parser.add_argument("--replace_with_nn", action="store_true", help="")
     parser.add_argument("--replacement_probs", default="0.8,0.5", type=str, help="Probability for masked tokens: P('[MASK]'|masked),P(random_token|masked,not'[MASK]').")
 
     args = parser.parse_args()
