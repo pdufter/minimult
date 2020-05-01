@@ -38,5 +38,4 @@ If you use the code, please consider citing the paper.
 
 # TODO
 * get rid of unnecessary folder hierarchies
-* Update readme
-* link arxiv upload
+* update readme
