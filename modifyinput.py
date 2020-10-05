@@ -3,7 +3,6 @@ from typing import Any, Set, Tuple, Text, Union, List
 from sklearn.metrics.pairwise import cosine_distances
 import numpy as np
 VECMAP = None
-# TMPCOUNT = -1
 
 
 def get_is_shifted(inputids: Union[torch.Tensor, List], shift: int) -> Union[torch.Tensor, bool]:
@@ -85,4 +84,3 @@ def replace_with_nn(inputids: torch.Tensor, model: Any, indices_random: torch.Te
     nns = torch.LongTensor(np.argsort(dist, axis=1)[:, :replace_with_nn])
     choice = torch.randint(low=0, high=nns.shape[1], size=(nns.shape[0], 1))
     inputids[indices_random] = torch.gather(nns, 1, choice).squeeze()
-

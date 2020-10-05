@@ -177,7 +177,7 @@ def evaluate_alignment(vectors, args):
 
 def load_perplexity(args):
     if not os.path.exists(os.path.join(args.model_name_or_path, "eval_results.txt")):
-        print("Warning: Perplexity not found.")
+        logger.warning("Perplexity not found.")
         return -1
     with open(os.path.join(args.model_name_or_path, "eval_results.txt"), "r") as fp:
         text = fp.read().strip()
