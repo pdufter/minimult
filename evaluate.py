@@ -1,9 +1,9 @@
-from projects.multlrf.utils import utils
-from projects.multlrf.run_language_modeling import load_and_cache_examples, mask_tokens, LineByLineTextDataset
+from utils import utils
+from run_language_modeling import load_and_cache_examples, mask_tokens, LineByLineTextDataset
 from torch.nn.utils.rnn import pad_sequence
-from projects.multlrf.shift import add_shifted_input, remove_parallel_data
-from projects.multlrf.modifymodel import delete_position_segment_embeddings
-from projects.multlrf.modifyinput import invert, get_language_specific_positions, shift_special_tokens
+from shift import add_shifted_input, remove_parallel_data
+from modifymodel import delete_position_segment_embeddings
+from modifyinput import invert, get_language_specific_positions, shift_special_tokens
 import logging
 import argparse
 from typing import List, Any, Set, Tuple, Text
@@ -54,8 +54,9 @@ def load_and_preprocess_corpus(eval_dataset, add_fake_english, args, tokenizer, 
     count = -1
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         count += 1
-        if count == 8:
+        if count == 68 or count == 1:
             pass
+            #import ipdb;ipdb.set_trace()
         if args.invert_order:
             invert(batch, model.config.shift)
         if args.language_specific_positions:
@@ -175,6 +176,9 @@ def evaluate_alignment(vectors, args):
 
 
 def load_perplexity(args):
+    if not os.path.exists(os.path.join(args.model_name_or_path, "eval_results.txt")):
+        print("Warning: Perplexity not found.")
+        return -1
     with open(os.path.join(args.model_name_or_path, "eval_results.txt"), "r") as fp:
         text = fp.read().strip()
         text = text.replace("perplexity = tensor(", "")
@@ -192,17 +196,28 @@ def get_modifications(args, config):
     if args.shift_special_tokens:
         modifications.append("shift-special")
     if args.replacement_probs:
-        modifications.append("repl-probs({},{})".format(*args.replacement_probs.split(",")))
+        formating = "repl-probs(" + ",".join(["{}" for x in args.replacement_probs.split(",")]) + ")"
+        modifications.append(formating.format(*args.replacement_probs.split(",")))
     if args.delete_position_segment_embeddings:
         modifications.append("del-pos")
     if args.do_not_replace_with_random_words:
         modifications.append("no-random")
     if args.no_parallel_data:
         modifications.append("no-parallel")
-    if args.replace_with_nn:
-        modifications.append("repl-nn")
+    if args.replace_with_nn > 0:
+        modifications.append("repl-nn({})".format(args.replace_with_nn))
+    if args.compute_loss_on_all:
+        modifications.append("all-loss")
+    if args.adjust_replacement_probs_with_time > 0:
+        modifications.append("dyn-replace({})".format(args.adjust_replacement_probs_with_time))
+    if args.use_anchor_points:
+        modifications.append("use-dict")
+    if args.crosslingual_context > 0:
+        modifications.append("cross-context({})".format(args.crosslingual_context))
     if config.hidden_size > 64:
-        modifications.append("overparam")
+        modifications.append("overparam({})".format(config.hidden_size))
+    if args.vecmap:
+        modifications.append("vecmap()")
     if len(modifications) == 0:
         modifications.append("original")
     return ";".join(modifications)
@@ -247,7 +262,6 @@ def format_result_line(args, perplexity, alignment_results, retrieval_results, t
 
 
 def evaluate_all(args):
-    import ipdb;ipdb.set_trace()
     outfile = open(args.outfile, "a")
     model, tokenizer, config = utils.load_embedding_model(args.model_name_or_path)
     args.special_token_indices = set([tokenizer.cls_token_id,
@@ -274,8 +288,6 @@ def evaluate_all(args):
 
 
 def main():
-    '''
-    '''
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--eval_data_file",
@@ -316,7 +328,12 @@ def main():
     parser.add_argument("--delete_position_segment_embeddings", action="store_true", help="FAKE NOT REQUIRED")
     parser.add_argument("--do_not_replace_with_random_words", action="store_true", help="FAKE NOT REQUIRED")
     parser.add_argument("--no_parallel_data", action="store_true", help="FAKE NOT REQUIRED")
-    parser.add_argument("--replace_with_nn", action="store_true", help="FAKE NOT REQUIRED")
+    parser.add_argument("--replace_with_nn", type=int, default=-1, help="FAKE NOT REQUIRED")
+    parser.add_argument("--crosslingual_context", type=float, default=-1, help="FAKE NOT REQUIRED")
+    parser.add_argument("--compute_loss_on_all", action="store_true", help="FAKE NOT REQUIRED")
+    parser.add_argument("--use_anchor_points", action="store_true", help="FAKE NOT REQUIRED")
+    parser.add_argument("--adjust_replacement_probs_with_time", type=float, default=-1, help="FAKE NOT REQUIRED")
+    parser.add_argument("--vecmap", type=str, default="", help="FAKE NOT REQUIRED")
 
     args = parser.parse_args()
 

@@ -10,6 +10,8 @@ def get_simple_bible(basepath: Text, edition: Text, outpath: Text, clean_punctua
 
     with open(outpath, "w") as fout:
         for k, v in data.items():
+            if args.old_testament_only and int(k[0]) > 3:
+                continue
             if clean_punctuation:
                 v = v.replace("”", "")
                 v = v.replace("’", "")
@@ -28,9 +30,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--pbc", default="/nfs/datc/pbc/", type=str, required=False, help="")
     parser.add_argument("--edition", default="eng_easytoread", type=str, required=True, help="")
-    parser.add_argument("--outpath", default="/mounts/work/philipp/multl/corpora/bible_eng_easytoread.txt",
+    parser.add_argument("--outpath", default="/mounts/work/${USER}/multl/corpora/bible_eng_easytoread.txt",
                         type=str, required=True, help="")
     parser.add_argument("--clean_punctuation", action="store_true", help="")
+    parser.add_argument("--old_testament_only", action="store_true", help="")
     args = parser.parse_args()
 
     get_simple_bible(args.pbc, args.edition, args.outpath, args.clean_punctuation)

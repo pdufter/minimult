@@ -1,4 +1,6 @@
-from typing import List, Text, Set
+from typing import List, Text, Set, Any
+import torch
+from modifyinput import get_is_shifted
 
 
 def shift_example(original: List[int], do_not_shift: Set[int], shift: int):
@@ -16,7 +18,6 @@ def add_shifted_input(original: List[List[int]], do_not_shift: Set[int], shift: 
     for example in original:
         to_add.append(shift_example(example, do_not_shift, shift))
     original.extend(to_add)
-
 
 def remove_parallel_data(original: List[List[int]]) -> None:
     if len(original) % 4 != 0:

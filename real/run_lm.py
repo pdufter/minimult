@@ -13,10 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-#
-# This code was modified by Philipp Dufter
-#
 """
 Fine-tuning the library models for language modeling on a text file (GPT, GPT-2, BERT, RoBERTa).
 GPT and GPT-2 are fine-tuned using a causal language modeling (CLM) loss while BERT and RoBERTa are fine-tuned
@@ -32,6 +28,7 @@ import pickle
 import random
 import re
 import shutil
+import collections
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -59,9 +56,8 @@ try:
 except ImportError:
     from tensorboardX import SummaryWriter
 
-from projects.multlrf.shift import add_shifted_input, remove_parallel_data
-from projects.multlrf.modifymodel import delete_position_segment_embeddings
-from projects.multlrf.modifyinput import invert, get_language_specific_positions, shift_special_tokens, replace_with_nn
+
+import real.modifications as modifications
 
 
 logger = logging.getLogger(__name__)
@@ -132,12 +128,15 @@ class LineByLineTextDataset(Dataset):
         return torch.tensor(self.examples[i], dtype=torch.long)
 
 
-def load_and_cache_examples(args, tokenizer, evaluate=False):
-    file_path = args.eval_data_file if evaluate else args.train_data_file
-    if args.line_by_line:
-        return LineByLineTextDataset(tokenizer, args, file_path=file_path, block_size=args.block_size)
-    else:
-        return TextDataset(tokenizer, args, file_path=file_path, block_size=args.block_size)
+def load_and_cache_examples(args, tokenizers, evaluate=False):
+    datasets = []
+    for i, tokenizer in enumerate(tokenizers): 
+        file_path = args.eval_data_file[i] if evaluate else args.train_data_file[i]
+        if args.line_by_line:
+            datasets.append(LineByLineTextDataset(tokenizer, args, file_path=file_path, block_size=args.block_size))
+        else:
+            datasets.append(TextDataset(tokenizer, args, file_path=file_path, block_size=args.block_size))
+    return datasets
 
 
 def set_seed(args):
@@ -184,7 +183,7 @@ def _rotate_checkpoints(args, checkpoint_prefix="checkpoint", use_mtime=False) -
         shutil.rmtree(checkpoint)
 
 
-def mask_tokens(inputs: torch.Tensor, tokenizer: PreTrainedTokenizer, args, model: PreTrainedModel) -> Tuple[torch.Tensor, torch.Tensor]:
+def mask_tokens(inputs: torch.Tensor, tokenizer: PreTrainedTokenizer, args, model) -> Tuple[torch.Tensor, torch.Tensor]:
     """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
     if tokenizer.mask_token is None:
         raise ValueError(
@@ -198,6 +197,11 @@ def mask_tokens(inputs: torch.Tensor, tokenizer: PreTrainedTokenizer, args, mode
         tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
     ]
     probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
+    # get all special tokens across all languages
+    my_special_tokens_mask = torch.zeros_like(inputs)
+    for special_token_index in args.all_special_tokens:
+        my_special_tokens_mask += (inputs == special_token_index)
+    probability_matrix.masked_fill_(my_special_tokens_mask.bool(), value=0.0)
     if tokenizer._pad_token is not None:
         padding_mask = labels.eq(tokenizer.pad_token_id)
         probability_matrix.masked_fill_(padding_mask, value=0.0)
@@ -205,18 +209,21 @@ def mask_tokens(inputs: torch.Tensor, tokenizer: PreTrainedTokenizer, args, mode
     labels[~masked_indices] = -100  # We only compute loss on masked tokens
 
     # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
-    indices_replaced = torch.bernoulli(torch.full(labels.shape, float(args.replacement_probs.split(",")[0]))).bool() & masked_indices
+    indices_replaced = torch.bernoulli(torch.full(labels.shape, args.replacement_probs[0])).bool() & masked_indices
     inputs[indices_replaced] = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
 
     # 10% of the time, we replace masked input tokens with random word
-    indices_random = torch.bernoulli(torch.full(labels.shape, float(args.replacement_probs.split(",")[1]))).bool() & masked_indices & ~indices_replaced
+    indices_random = torch.bernoulli(torch.full(labels.shape, args.replacement_probs[1])).bool() & masked_indices & ~indices_replaced
+    indices_replaced = indices_replaced | indices_random
     if args.do_not_replace_with_random_words:
         inputs[indices_random] = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
-    elif args.replace_with_nn:
-        replace_with_nn(inputs, model, indices_random)
     else:
         random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long)
         inputs[indices_random] = random_words[indices_random]
+
+    if args.replace_with_nn > 0:
+        indices_random = torch.bernoulli(torch.full(labels.shape, args.replacement_probs[2])).bool() & masked_indices & ~indices_replaced
+        modifications.replace_with_nn(inputs, model, indices_random, args.replace_with_nn, model.config.shifts, vecmap_space=args.vecmap, tok=tokenizer)
 
     # The rest of the time (10% of the time) we keep the masked input tokens unchanged
     return inputs, labels
@@ -329,7 +336,6 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
         epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0]
     )
     set_seed(args)  # Added here for reproducibility
-    mycounter = 0
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
@@ -339,40 +345,24 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
                 steps_trained_in_current_epoch -= 1
                 continue
             if args.invert_order:
-                invert(batch, model.config.shift)
+                modifications.invert(batch, model.config.shifts, args, tokenizer)
             if args.language_specific_positions:
                 if args.block_size > 256:
                     raise ValueError("Language specific posiiton embeddings can only be <256.")
-                position_ids, segment_ids = get_language_specific_positions(batch, model.config.shift, args.block_size)
+                position_ids, segment_ids = modifications.get_language_specific_positions(batch, model.config.shifts, args.block_size, tokenizer)
                 position_ids = position_ids.to(args.device)
                 segment_ids = segment_ids.to(args.device)
             else:
                 position_ids, segment_ids = None, None
-                # input_shape = batch.size()
-                # seq_length = input_shape[1]
-                # position_ids = torch.arange(seq_length, dtype=torch.long)
-                # position_ids = position_ids.unsqueeze(0).expand(input_shape)
-                # segment_ids = torch.zeros(input_shape, dtype=torch.long)
-                # position_ids = position_ids.to(args.device)
-                # segment_ids = segment_ids.to(args.device)
+
             inputs, labels = mask_tokens(batch, tokenizer, args, model) if args.mlm else (batch, batch)
             if args.shift_special_tokens:
-                shift_special_tokens(inputs, model.config.shift, args.special_token_indices)
+                modifications.shift_special_tokens(inputs, model.config.shifts, args.special_token_indices, tokenizer)
+            else:
+                modifications.unshift_special_tokens(inputs, model.config.shifts, args.special_token_indices, tokenizer)
             inputs = inputs.to(args.device)
             labels = labels.to(args.device)
             model.train()
-            mycounter += 1
-            if mycounter < 5:
-                logger.info("\n")
-                logger.info("#" * 10 + " {} ".format(mycounter) + "#"*10)
-                logger.info("-" * 30 + " INPUTS")
-                logger.info(inputs)
-                logger.info("-" * 30 + " POSITIONS")
-                logger.info(position_ids)
-                logger.info("-" * 30 + " TOKENS")
-                logger.info(segment_ids)
-                logger.info("-" * 30 + " LABELS")
-                logger.info(labels)
             outputs = model(inputs, masked_lm_labels=labels, position_ids=position_ids, token_type_ids=segment_ids) if args.mlm else model(inputs, labels=labels)
             loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
 
@@ -443,14 +433,13 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
     return global_step, tr_loss / global_step
 
 
-def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefix="") -> Dict:
+def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, tokenizer_langs, prefix="") -> Dict:
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_output_dir = args.output_dir
 
-    eval_dataset = load_and_cache_examples(args, tokenizer, evaluate=True)
-    if args.add_fake_english:
-        add_shifted_input(eval_dataset.examples, args.special_token_indices, model.config.shift)
-    # remove parallel data is not meaningful for evaluation
+    eval_dataset = load_and_cache_examples(args, tokenizer_langs, evaluate=True)
+    eval_dataset = modifications.merge_datasets(eval_dataset, model.config.shifts)
+
     if args.local_rank in [-1, 0]:
         os.makedirs(eval_output_dir, exist_ok=True)
 
@@ -478,38 +467,30 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
     eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
-    mycounter = 0
+
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         if args.invert_order:
-            invert(batch, model.config.shift)
+            modifications.invert(batch, model.config.shifts, args, tokenizer)
         if args.language_specific_positions:
             if args.block_size > 256:
                 raise ValueError("Language specific posiiton embeddings can only be <256.")
-            position_ids, segment_ids = get_language_specific_positions(batch, model.config.shift, args.block_size)
+            position_ids, segment_ids = modifications.get_language_specific_positions(batch, model.config.shifts, args.block_size, tokenizer)
             position_ids = position_ids.to(args.device)
             segment_ids = segment_ids.to(args.device)
         else:
             position_ids, segment_ids = None, None
+
         inputs, labels = mask_tokens(batch, tokenizer, args, model) if args.mlm else (batch, batch)
         if args.shift_special_tokens:
-            shift_special_tokens(inputs, model.config.shift, args.special_token_indices)
-        mycounter += 1
-        if mycounter < 5:
-            logger.info("")
-            logger.info("#" * 10 + " {} ".format(mycounter) + "#"*10)
-            logger.info("-" * 30 + " INPUTS")
-            logger.info(inputs)
-            logger.info("-" * 30 + " POSITIONS")
-            logger.info(position_ids)
-            logger.info("-" * 30 + " TOKENS")
-            logger.info(segment_ids)
-            logger.info("-" * 30 + " LABELS")
-            logger.info(labels)
+            modifications.shift_special_tokens(inputs, model.config.shifts, args.special_token_indices, tokenizer)
+        else:
+            modifications.unshift_special_tokens(inputs, model.config.shifts, args.special_token_indices, tokenizer)
+
         inputs = inputs.to(args.device)
         labels = labels.to(args.device)
 
         with torch.no_grad():
-            outputs = model(inputs, masked_lm_labels=labels, position_ids=position_ids, token_type_ids=segment_ids) if args.mlm else model(inputs, labels=labels)
+            outputs = model(inputs, masked_lm_labels=labels) if args.mlm else model(inputs, labels=labels)
             lm_loss = outputs[0]
             eval_loss += lm_loss.mean().item()
         nb_eval_steps += 1
@@ -670,20 +651,24 @@ def main():
     parser.add_argument("--server_ip", type=str, default="", help="For distant debugging.")
     parser.add_argument("--server_port", type=str, default="", help="For distant debugging.")
 
-    parser.add_argument("--add_fake_english", action="store_true", help="")
-    parser.add_argument("--no_parallel_data", action="store_true", help="")
-
-    parser.add_argument("--delete_position_segment_embeddings", action="store_true", help="")
-
+    parser.add_argument("--language_id", type=str, default="", help="Language IDs deduced from order.")
     parser.add_argument("--language_specific_positions", action="store_true", help="")
     parser.add_argument("--invert_order", action="store_true", help="")
     parser.add_argument("--shift_special_tokens", action="store_true", help="")
-
-    parser.add_argument("--do_not_replace_with_random_words", action="store_true", help="")
-    parser.add_argument("--replace_with_nn", action="store_true", help="")
+    parser.add_argument("--invert_langs", type=str, default="", help="")
     parser.add_argument("--replacement_probs", default="0.8,0.5", type=str, help="Probability for masked tokens: P('[MASK]'|masked),P(random_token|masked,not'[MASK]').")
+    parser.add_argument("--do_not_replace_with_random_words", action="store_true", help="")
+    parser.add_argument("--replace_with_nn", type=int, default=-1, help="if > 0 replace masked words with nearest neighbours")
+    parser.add_argument("--vecmap", default=None, type=str, help="File to a multilingual space.")
 
     args = parser.parse_args()
+    # process args
+    args.replacement_probs = [float(x) for x in args.replacement_probs.split(",")]
+    args.language_id = args.language_id.split(",")
+    args.invert_langs = args.invert_langs.split(",")
+    args.tokenizer_name = args.tokenizer_name.split(",")
+    args.train_data_file = args.train_data_file.split(",")
+    args.eval_data_file = args.eval_data_file.split(",")
 
     if args.model_type in ["bert", "roberta", "distilbert", "camembert"] and not args.mlm:
         raise ValueError(
@@ -768,13 +753,13 @@ def main():
             "You are instantiating a new config instance from scratch. This is not supported, but you can do it from another script, save it,"
             "and load it from here, using --config_name"
         )
-    if args.add_fake_english:
-        # double vocab size and add shift_parameter
-        config.shift = config.vocab_size
-        config.vocab_size *= 2
 
     if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, cache_dir=args.cache_dir, config=config)
+        tokenizer_langs = []
+        config.shifts = [0]
+        for tokenizer_name in args.tokenizer_name:
+            tokenizer_langs.append(AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=args.cache_dir, config=config))
+        tokenizer, config.shifts = modifications.merge_tokenizers(tokenizer_langs, args)
     elif args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, cache_dir=args.cache_dir, config=config)
     else:
@@ -783,19 +768,21 @@ def main():
             "and load it from here, using --tokenizer_name"
         )
 
-    args.special_token_indices = set([tokenizer.cls_token_id,
-        tokenizer.sep_token_id,
-        tokenizer.mask_token_id,
-        tokenizer.unk_token_id,
-        tokenizer.pad_token_id])
+    config.vocab_size = len(tokenizer.get_vocab())
+    config.type_vocab_size = len(args.language_id)
+    config.max_position_embeddings = len(args.language_id) * args.block_size
 
-    if args.add_fake_english:
-        shifted_vocab = [("::" + k, v + config.shift) for k, v in tokenizer.vocab.items()]
-        tokenizer.vocab.update(shifted_vocab)
+    args.special_token_indices = set([tokenizer.cls_token_id,
+            tokenizer.sep_token_id,
+            tokenizer.mask_token_id,
+            tokenizer.unk_token_id,
+            tokenizer.pad_token_id])
+    args.all_special_tokens = set()
+    for shift in config.shifts[:-1]:
+        args.all_special_tokens = args.all_special_tokens | set([x + shift for x in args.special_token_indices])
 
     if args.block_size <= 0:
         args.block_size = tokenizer.max_len
-        # Our input block size will be the max possible for the model
     else:
         args.block_size = min(args.block_size, tokenizer.max_len)
 
@@ -810,27 +797,22 @@ def main():
         logger.info("Training new model from scratch")
         model = AutoModelWithLMHead.from_config(config)
 
-    if args.delete_position_segment_embeddings:
-        logger.info("Deleting position embeddings.")
-        delete_position_segment_embeddings(model)
     model.to(args.device)
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # End of barrier to make sure only the first process in distributed training download model & vocab
 
     logger.info("Training/evaluation parameters %s", args)
+
     # Training
     if args.do_train:
         if args.local_rank not in [-1, 0]:
             torch.distributed.barrier()  # Barrier to make sure only the first process in distributed training process the dataset, and the others will use the cache
 
-        train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False)
-        if args.add_fake_english:
-            logger.info("Adding fake-english.")
-            add_shifted_input(train_dataset.examples, args.special_token_indices, model.config.shift)
-        if args.no_parallel_data:
-            logger.info("Removing Parallel data.")
-            train_dataset.examples = remove_parallel_data(train_dataset.examples)
+        train_dataset = load_and_cache_examples(args, tokenizer_langs, evaluate=False)
+        # need to merge datasets!
+        train_dataset = modifications.merge_datasets(train_dataset, config.shifts)
+
         if args.local_rank == 0:
             torch.distributed.barrier()
 
@@ -873,12 +855,10 @@ def main():
         for checkpoint in checkpoints:
             global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
             prefix = checkpoint.split("/")[-1] if checkpoint.find("checkpoint") != -1 else ""
-            # manual fix to allow evaluating individual checkpoints
-            prefix = ""
 
             model = AutoModelWithLMHead.from_pretrained(checkpoint)
             model.to(args.device)
-            result = evaluate(args, model, tokenizer, prefix=prefix)
+            result = evaluate(args, model, tokenizer, tokenizer_langs, prefix=prefix)
             result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
             results.update(result)
 
